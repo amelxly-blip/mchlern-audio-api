@@ -2,6 +2,7 @@ import os
 import base64
 import tempfile
 import urllib.parse
+import re
 
 import requests
 import yt_dlp
@@ -51,7 +52,6 @@ async def root():
     <h1>🎵 MCHLERN Audio Fetcher API</h1>
     <p>Status: <span style="color:#22c55e">🟢 Online</span></p>
     <p>Endpoint: <code>POST /api/fetch-audio</code></p>
-    <p>Body: <code>{"url": "https://youtube.com/...", "cookies": ""}</code></p>
     </body></html>
     """
 
@@ -59,6 +59,21 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+def clean_error_message(err_str: str) -> str:
+    s = str(err_str)
+    if "unavailable" in s.lower():
+        return "Video tidak tersedia di YouTube (mungkin video dihapus, ID salah, atau di-set private)."
+    if "private video" in s.lower():
+        return "Video YouTube ini bersifat Private dan tidak dapat diakses."
+    if "bot" in s.lower() or "sign in" in s.lower():
+        return "YouTube meminta verifikasi login (bot check). Perbarui youtube_cookies.txt di Admin Panel."
+    if "georestricted" in s.lower() or "not available in your country" in s.lower():
+        return "Video ini dibatasi secara geografis (region-locked) oleh YouTube."
+    # Stripping technical yt-dlp prefix
+    s = re.sub(r"^ERROR:\s*\[[^\]]+\]\s*", "", s).strip()
+    return s[:200] if s else "Gagal mengambil audio dari YouTube."
 
 
 @app.post("/api/fetch-audio")
@@ -72,7 +87,7 @@ async def fetch_audio(req: FetchRequest):
     temp_dir = tempfile.gettempdir()
 
     cookie_file = None
-    if req.cookies.strip():
+    if req.cookies and req.cookies.strip():
         c_text = req.cookies.strip()
         try:
             decoded = base64.b64decode(c_text).decode("utf-8")
@@ -85,10 +100,21 @@ async def fetch_audio(req: FetchRequest):
             f.write(c_text)
         cookie_file = cf_path
 
-    client_attempts = ["android", "tv_embedded", "web", "ios"]
+    # Buat percobaan:
+    # 1. Dengan cookies jika ada
+    # 2. Tanpa cookies sebagai fallback jika cookies kadaluarsa
+    attempts = []
+    clients = ["android", "web", "tv_embedded", "ios"]
+    
+    if cookie_file:
+        for c in clients:
+            attempts.append((c, cookie_file))
+    for c in clients:
+        attempts.append((c, None))
+
     last_err = None
 
-    for client in client_attempts:
+    for client, c_file in attempts:
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -105,8 +131,8 @@ async def fetch_audio(req: FetchRequest):
             "noplaylist": True,
             "max_filesize": 25 * 1024 * 1024,
         }
-        if cookie_file:
-            ydl_opts["cookiefile"] = cookie_file
+        if c_file:
+            ydl_opts["cookiefile"] = c_file
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -119,6 +145,13 @@ async def fetch_audio(req: FetchRequest):
                 title = info.get("title") or "YouTube Audio"
                 thumb = spotify_thumb or info.get("thumbnail") or ""
                 duration = info.get("duration") or 0
+
+                # Roblox limit 7 menit
+                if duration and duration > 420:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Durasi audio ({int(duration // 60)}m {int(duration % 60)}s) melebihi batas Roblox (maks 7 menit)."
+                    )
 
                 raw_file = ydl.prepare_filename(info)
                 mp3_file = os.path.splitext(raw_file)[0] + ".mp3"
@@ -134,23 +167,23 @@ async def fetch_audio(req: FetchRequest):
                 except Exception:
                     pass
 
-                clean_title = title.replace("/", "_").replace("\\", "_")[:50]
+                clean_title = re.sub(r'[/\\?%*:|"<>#]', '_', title)[:50].strip() or "Audio"
                 return Response(
                     content=audio_bytes,
                     media_type="audio/mpeg",
                     headers={
                         "Content-Disposition": f'attachment; filename="{urllib.parse.quote(clean_title)}.mp3"',
-                        "X-Title": urllib.parse.quote(title[:50]),
+                        "X-Title": urllib.parse.quote(clean_title),
                         "X-Thumbnail": urllib.parse.quote(thumb),
                         "X-Duration": str(duration),
                         "Access-Control-Expose-Headers": "X-Title, X-Thumbnail, X-Duration",
                     }
                 )
+        except HTTPException:
+            raise
         except Exception as e:
             last_err = str(e)
             continue
 
-    raise HTTPException(
-        status_code=502,
-        detail=f"Gagal mengambil audio: {last_err or 'Semua client gagal'}"
-    )
+    friendly = clean_error_message(last_err or "Semua client gagal")
+    raise HTTPException(status_code=502, detail=friendly)
