@@ -29,6 +29,27 @@ class FetchRequest(BaseModel):
     cookies: str = ""
 
 
+def clean_youtube_url(raw_url: str) -> str:
+    """Membersihkan URL YouTube dari query parameter pelacak (si, feature) dan menormalisasi music.youtube.com"""
+    try:
+        parsed = urllib.parse.urlparse(raw_url.strip())
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        # Ubah music.youtube.com menjadi www.youtube.com
+        hostname = (parsed.hostname or "").lower()
+        if "music.youtube.com" in hostname or "youtube.com" in hostname:
+            v_id = qs.get("v", [None])[0]
+            if v_id:
+                return f"https://www.youtube.com/watch?v={v_id}"
+        elif "youtu.be" in hostname:
+            v_id = parsed.path.lstrip("/")
+            if v_id:
+                return f"https://www.youtube.com/watch?v={v_id}"
+    except Exception:
+        pass
+    return raw_url.strip()
+
+
 def resolve_spotify(url: str):
     if "spotify.com" in url:
         try:
@@ -68,11 +89,11 @@ def clean_error_message(err_str: str) -> str:
     if "private video" in s.lower():
         return "Video YouTube ini bersifat Private dan tidak dapat diakses."
     if "bot" in s.lower() or "sign in" in s.lower():
-        return "YouTube meminta verifikasi login (bot check). Perbarui cookies di Admin Panel."
+        return "YouTube meminta verifikasi login (bot check). Masukkan cookies YouTube di Admin Panel."
     if "georestricted" in s.lower() or "not available in your country" in s.lower():
         return "Video ini dibatasi secara geografis (region-locked) oleh YouTube."
     if "nsig" in s.lower() or "cipher" in s.lower() or "throttl" in s.lower():
-        return "YouTube memperbarui sistem proteksi. Coba beberapa saat lagi."
+        return "YouTube membatasi akses video ini. Coba beberapa saat lagi."
     s = re.sub(r"^ERROR:\s*\[[^\]]+\]\s*", "", s).strip()
     return s[:200] if s else "Gagal mengambil audio dari YouTube."
 
@@ -83,11 +104,14 @@ async def fetch_audio(req: FetchRequest):
     if not raw_url:
         raise HTTPException(status_code=400, detail="URL tidak boleh kosong.")
 
+    # 1. Normalisasi URL
+    normalized_url = clean_youtube_url(raw_url)
+    url, spotify_thumb = resolve_spotify(normalized_url)
+
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    url, spotify_thumb = resolve_spotify(raw_url)
     temp_dir = tempfile.gettempdir()
 
-    # Siapkan file cookie jika disediakan
+    # 2. Siapkan file cookie jika disediakan
     cookie_file = None
     if req.cookies and req.cookies.strip():
         c_text = req.cookies.strip()
@@ -105,21 +129,15 @@ async def fetch_audio(req: FetchRequest):
         except Exception:
             cookie_file = None
 
-    # STRATEGI CLIENT — urutan dari yang paling likely bypass bot check:
-    # ios & mweb paling konsisten di server cloud tanpa cookies
-    # tv_embedded & mediaconnect sebagai fallback
-    # web + cookies sebagai last resort
+    # 3. Urutan client: android dan ios adalah yang paling stabil dan cepat
     attempts = [
+        ("android", None),
         ("ios", None),
         ("mweb", None),
-        ("android", None),
-        ("tv_embedded", None),
-        ("mediaconnect", None),
     ]
     if cookie_file:
-        attempts.append(("ios", cookie_file))
+        attempts.insert(0, ("android", cookie_file))
         attempts.append(("web", cookie_file))
-        attempts.append(("android", cookie_file))
 
     last_err = None
 
@@ -127,7 +145,7 @@ async def fetch_audio(req: FetchRequest):
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
-            "format": "ba[ext=m4a]/bestaudio[ext=m4a]/bestaudio/best",
+            "format": "ba[ext=m4a]/ba/b/bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "mchlern_%(id)s.%(ext)s"),
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
@@ -143,14 +161,8 @@ async def fetch_audio(req: FetchRequest):
             },
             "nocheckcertificate": True,
             "noplaylist": True,
-            "socket_timeout": 15,
+            "socket_timeout": 12,
             "max_filesize": 25 * 1024 * 1024,
-            # Spoof as a real browser to reduce bot detection
-            "http_headers": {
-                "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-                "Accept": "*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
         }
         if c_file:
             ydl_opts["cookiefile"] = c_file
@@ -204,7 +216,6 @@ async def fetch_audio(req: FetchRequest):
             raise
         except Exception as e:
             last_err = str(e)
-            # Kalau video memang tidak tersedia, jangan buang waktu retry client lain
             if any(x in last_err.lower() for x in ["unavailable", "private video", "has been removed"]):
                 break
             continue
