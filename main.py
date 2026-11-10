@@ -127,18 +127,19 @@ async def fetch_audio(req: FetchRequest):
         except Exception:
             cookie_file = None
 
-    # STRATEGI:
-    # Jika cookies browser ada: gunakan client 'web' dan 'mweb' terlebih dahulu (ini client yang tepat untuk cookies browser!)
-    # Jika tanpa cookies: gunakan 'android' dan 'ios'
-    attempts = []
+    # Strategi yang terbukti tembus:
+    # 1. client 'android' dengan format fallback 'ba[ext=m4a]/ba/b/18/best'
+    # 2. client 'web' dengan cookies (jika ada)
+    # 3. client 'mweb'
+    attempts = [
+        ("android", None),
+    ]
     if cookie_file:
         attempts.append(("web", cookie_file))
         attempts.append(("mweb", cookie_file))
-        attempts.append(("ios", cookie_file))
-
-    attempts.append(("android", None))
-    attempts.append(("ios", None))
+        attempts.append(("android", cookie_file))
     attempts.append(("mweb", None))
+    attempts.append(("web", None))
 
     last_err = None
 
@@ -146,7 +147,7 @@ async def fetch_audio(req: FetchRequest):
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
-            "format": "ba[ext=m4a]/ba/b/bestaudio/best",
+            "format": "ba[ext=m4a]/ba/b/18/best",
             "outtmpl": os.path.join(temp_dir, "mchlern_%(id)s.%(ext)s"),
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
@@ -162,8 +163,9 @@ async def fetch_audio(req: FetchRequest):
             },
             "nocheckcertificate": True,
             "noplaylist": True,
-            "socket_timeout": 12,
-            "max_filesize": 25 * 1024 * 1024,
+            "socket_timeout": 15,
+            # Tingkatkan batas ke 100MB agar video progresif 360p bisa didownload lalu diekstrak audionya
+            "max_filesize": 100 * 1024 * 1024,
         }
         if c_file:
             ydl_opts["cookiefile"] = c_file
