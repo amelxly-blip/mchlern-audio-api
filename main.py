@@ -30,12 +30,11 @@ class FetchRequest(BaseModel):
 
 
 def clean_youtube_url(raw_url: str) -> str:
-    """Membersihkan URL YouTube dari query parameter pelacak (si, feature) dan menormalisasi music.youtube.com"""
+    """Membersihkan URL YouTube dari parameter pelacak (si, feature) dan menormalisasi music.youtube.com"""
     try:
         parsed = urllib.parse.urlparse(raw_url.strip())
         qs = urllib.parse.parse_qs(parsed.query)
 
-        # Ubah music.youtube.com menjadi www.youtube.com
         hostname = (parsed.hostname or "").lower()
         if "music.youtube.com" in hostname or "youtube.com" in hostname:
             v_id = qs.get("v", [None])[0]
@@ -89,7 +88,7 @@ def clean_error_message(err_str: str) -> str:
     if "private video" in s.lower():
         return "Video YouTube ini bersifat Private dan tidak dapat diakses."
     if "bot" in s.lower() or "sign in" in s.lower():
-        return "YouTube meminta verifikasi login (bot check). Masukkan cookies YouTube di Admin Panel."
+        return "YouTube meminta verifikasi login (bot check). Perbarui cookies di Admin Panel."
     if "georestricted" in s.lower() or "not available in your country" in s.lower():
         return "Video ini dibatasi secara geografis (region-locked) oleh YouTube."
     if "nsig" in s.lower() or "cipher" in s.lower() or "throttl" in s.lower():
@@ -104,14 +103,13 @@ async def fetch_audio(req: FetchRequest):
     if not raw_url:
         raise HTTPException(status_code=400, detail="URL tidak boleh kosong.")
 
-    # 1. Normalisasi URL
     normalized_url = clean_youtube_url(raw_url)
     url, spotify_thumb = resolve_spotify(normalized_url)
 
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     temp_dir = tempfile.gettempdir()
 
-    # 2. Siapkan file cookie jika disediakan
+    # Siapkan file cookie jika disediakan
     cookie_file = None
     if req.cookies and req.cookies.strip():
         c_text = req.cookies.strip()
@@ -129,15 +127,18 @@ async def fetch_audio(req: FetchRequest):
         except Exception:
             cookie_file = None
 
-    # 3. Urutan client: android dan ios adalah yang paling stabil dan cepat
-    attempts = [
-        ("android", None),
-        ("ios", None),
-        ("mweb", None),
-    ]
+    # STRATEGI:
+    # Jika cookies browser ada: gunakan client 'web' dan 'mweb' terlebih dahulu (ini client yang tepat untuk cookies browser!)
+    # Jika tanpa cookies: gunakan 'android' dan 'ios'
+    attempts = []
     if cookie_file:
-        attempts.insert(0, ("android", cookie_file))
         attempts.append(("web", cookie_file))
+        attempts.append(("mweb", cookie_file))
+        attempts.append(("ios", cookie_file))
+
+    attempts.append(("android", None))
+    attempts.append(("ios", None))
+    attempts.append(("mweb", None))
 
     last_err = None
 
