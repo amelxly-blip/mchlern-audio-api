@@ -71,6 +71,8 @@ def clean_error_message(err_str: str) -> str:
         return "YouTube meminta verifikasi login (bot check). Perbarui cookies di Admin Panel."
     if "georestricted" in s.lower() or "not available in your country" in s.lower():
         return "Video ini dibatasi secara geografis (region-locked) oleh YouTube."
+    if "nsig" in s.lower() or "cipher" in s.lower() or "throttl" in s.lower():
+        return "YouTube memperbarui sistem proteksi. Coba beberapa saat lagi."
     s = re.sub(r"^ERROR:\s*\[[^\]]+\]\s*", "", s).strip()
     return s[:200] if s else "Gagal mengambil audio dari YouTube."
 
@@ -103,18 +105,21 @@ async def fetch_audio(req: FetchRequest):
         except Exception:
             cookie_file = None
 
-    # STRATEGI CEPAT:
-    # 1. Coba android TANPA cookies dulu (super cepat ~3 detik, bypass bot check)
-    # 2. Coba tv_embedded / web TANPA cookies
-    # 3. Baru jika ada cookie_file dan gagal, coba dengan cookies
+    # STRATEGI CLIENT — urutan dari yang paling likely bypass bot check:
+    # ios & mweb paling konsisten di server cloud tanpa cookies
+    # tv_embedded & mediaconnect sebagai fallback
+    # web + cookies sebagai last resort
     attempts = [
+        ("ios", None),
+        ("mweb", None),
         ("android", None),
         ("tv_embedded", None),
-        ("web", None),
+        ("mediaconnect", None),
     ]
     if cookie_file:
-        attempts.append(("android", cookie_file))
+        attempts.append(("ios", cookie_file))
         attempts.append(("web", cookie_file))
+        attempts.append(("android", cookie_file))
 
     last_err = None
 
@@ -122,7 +127,7 @@ async def fetch_audio(req: FetchRequest):
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
-            "format": "ba[ext=m4a]/bestaudio/b/best",
+            "format": "ba[ext=m4a]/bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "mchlern_%(id)s.%(ext)s"),
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
@@ -130,11 +135,22 @@ async def fetch_audio(req: FetchRequest):
                 "preferredquality": "192",
             }],
             "ffmpeg_location": ffmpeg_path,
-            "extractor_args": {"youtube": {"player_client": [client]}},
+            "extractor_args": {
+                "youtube": {
+                    "player_client": [client],
+                    "skip": ["hls", "dash"],
+                }
+            },
             "nocheckcertificate": True,
             "noplaylist": True,
-            "socket_timeout": 12,
+            "socket_timeout": 15,
             "max_filesize": 25 * 1024 * 1024,
+            # Spoof as a real browser to reduce bot detection
+            "http_headers": {
+                "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         }
         if c_file:
             ydl_opts["cookiefile"] = c_file
@@ -155,7 +171,7 @@ async def fetch_audio(req: FetchRequest):
                 if duration and duration > 420:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Durasi audio ({int(duration // 60)}m {int(duration % 60)}s) melebihi batas Roblox (maks 7 menit)."
+                        detail=f"Durasi audio ({int(duration // 60)}m {int(duration % 60)}s) melebihi batas Roblox (maks 7 menit).",
                     )
 
                 raw_file = ydl.prepare_filename(info)
@@ -188,8 +204,8 @@ async def fetch_audio(req: FetchRequest):
             raise
         except Exception as e:
             last_err = str(e)
-            # Jika video memang unavailable/private, jangan buang waktu coba client lain
-            if "unavailable" in last_err.lower() or "private video" in last_err.lower():
+            # Kalau video memang tidak tersedia, jangan buang waktu retry client lain
+            if any(x in last_err.lower() for x in ["unavailable", "private video", "has been removed"]):
                 break
             continue
 
